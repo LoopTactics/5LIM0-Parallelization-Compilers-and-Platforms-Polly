@@ -47,9 +47,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "polly/ScheduleOptimizer.h"
+#include "polly/Access.h"
+#include "polly/Access_patterns.h"
+#include "polly/Builders.h"
 #include "polly/CodeGen/CodeGeneration.h"
 #include "polly/DependenceInfo.h"
 #include "polly/LinkAllPasses.h"
+#include "polly/Matchers.h"
 #include "polly/Options.h"
 #include "polly/ScopInfo.h"
 #include "polly/ScopPass.h"
@@ -264,6 +268,11 @@ static cl::opt<bool>
     PMBasedOpts("polly-pattern-matching-based-opts",
                 cl::desc("Perform optimizations based on pattern matching"),
                 cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
+
+static cl::opt<bool>
+    DPMBasedOpts("polly-declarative-pattern-matching-based-opts",
+                 cl::desc("Perform optimizations with Loop Tactics"),
+                 cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
 
 static cl::opt<bool> OptimizedScops(
     "polly-optimized-scops",
@@ -1325,6 +1334,235 @@ bool ScheduleTreeOptimizer::isMatrMultPattern(isl::schedule_node Node,
   return false;
 }
 
+/// isl ids are pointer-comparable.
+bool operator==(const isl::id &left, const isl::id &right) {
+  return left.get() == right.get();
+}
+
+/// isl ids are pointer-comparable.
+bool operator!=(const isl::id &left, const isl::id &right) {
+  return left.get() != right.get();
+}
+
+/// Get a tagged access relation containing all accesses of type @p AccessTy.
+/// Only array accesses are returned (see class MemoryAccess)
+/// Instead of a normal access of the form:
+///
+///   Stmt[i,j,k] -> Array[f_0(i,j,k), f_1(i,j,k)]
+///
+/// a tagged access has the form
+///
+///   [Stmt[i,j,k] -> id[]] -> Array[f_0(i,j,k), f_1(i,j,k)]
+///
+/// where 'id' is an additional space that references the memory access that
+/// triggered the access.
+///
+/// @param Scop The current Scop
+/// @param AccessTy The type of the memory accesses to collect.
+/// @param Schedule The schedule used to restrict the accesses.
+/// @return The relation describing all tagged memory accesses.
+static isl::union_map getTaggedAccesses(const Scop &Scop,
+                                        enum MemoryAccess::AccessType AccessTy,
+                                        isl::union_map Schedule) {
+
+  auto Accesses = isl::union_map::empty(Scop.getParamSpace());
+  for (auto &Stmt : Scop) {
+    for (auto &Acc : Stmt) {
+      if (Acc->getLatestKind() != MemoryKind::Array)
+        continue;
+      if (Acc->getType() == AccessTy) {
+        auto Relation = Acc->getLatestAccessRelation();
+        auto RelationId = Relation.get_tuple_id(isl::dim::in);
+        auto ScheduleDomain = isl::set(Schedule.domain());
+        auto ScheduleDomainId = ScheduleDomain.get_tuple_id();
+        if (RelationId != ScheduleDomainId)
+          continue;
+        Relation = Relation.intersect_domain(Stmt.getDomain());
+
+        auto Space = Relation.get_space();
+        Space = Space.range();
+        Space = Space.from_range();
+        Space = Space.set_tuple_id(isl::dim::in, Acc->getId());
+        auto Universe = isl::map::universe(Space);
+        Relation = Relation.domain_product(Universe);
+        Accesses = Accesses.add_map(Relation);
+      }
+    }
+  }
+  return Accesses;
+}
+
+/// Get the set of all read accesses, restricted to "Schedule".
+static isl::union_map getTaggedReads(const Scop &s, isl::union_map Schedule) {
+  return getTaggedAccesses(s, MemoryAccess::READ, Schedule);
+}
+
+/// Get the set of all must write accesses, restricted to "Schedule".
+static isl::union_map getTaggedMustWrites(const Scop &s,
+                                          isl::union_map Schedule) {
+  return getTaggedAccesses(s, MemoryAccess::MUST_WRITE, Schedule);
+}
+
+/// Utility function for wrapOnMatch. Check if the node matches with
+/// the pattern, and if so wrap the node with a mark node. The mark
+/// node is created with the id "Id".
+static isl::schedule_node
+wrapPattern(isl::schedule_node Node,
+            const matchers::ScheduleNodeMatcher &Pattern, isl::id Id) {
+  if (matchers::ScheduleNodeMatcher::isMatching(Pattern, Node)) {
+    Node = Node.insert_mark(Id);
+  }
+  return Node;
+}
+
+/// Wrap the subtree rooted at "Root" with id "id" if the
+/// subtree matches with "Pattern".
+static isl::schedule_node
+wrapPatternOnMatch(isl::schedule_node Root,
+                   const matchers::ScheduleNodeMatcher &Pattern, isl::id Id) {
+  Root = wrapPattern(Root, Pattern, Id);
+  // avoid looking again in the matched subtree.
+  if ((isl_schedule_node_get_type(Root.get())) == isl_schedule_node_mark) {
+    auto RootId = Root.mark_get_id();
+    if (RootId == Id)
+      return Root;
+  }
+  for (int i = 0; i < Root.n_children(); i++) {
+    Root = wrapPatternOnMatch(Root.child(i), Pattern, Id).parent();
+  }
+  return Root;
+}
+
+/// Check it the schedule tree rooted at "Node" has been annotated with id "Id"
+static bool checkIfAnnotated(isl::schedule_node Node, isl::id Id) {
+  auto Root = Node.root();
+
+  struct Payload {
+    bool isAnnotated = false;
+    isl::id *Id = nullptr;
+  } Py;
+  Py.Id = &Id;
+
+  isl_schedule_node_foreach_descendant_top_down(
+      Root.get(),
+      [](__isl_keep isl_schedule_node *NodePtr, void *User) -> isl_bool {
+        Payload *P = static_cast<Payload *>(User);
+        auto Node = isl::manage_copy(NodePtr);
+        if (isl_schedule_node_get_type(Node.get()) == isl_schedule_node_mark) {
+          auto Id = Node.mark_get_id();
+          if (Id == *(P->Id))
+            P->isAnnotated = true;
+        }
+        return isl_bool_true;
+      },
+      &Py);
+  return Py.isAnnotated;
+}
+
+/// Check if "Band" has a MatrMul-like access pattern.
+static bool hasMatrMulAccessPatternImpl(isl::schedule_node Band,
+                                        const Scop &Scop) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+  if (isl_schedule_node_get_type(Band.get()) != isl_schedule_node_band)
+    llvm_unreachable("expect a band node");
+  auto Schedule = isl::union_map::from(Band.band_get_partial_schedule());
+  auto Reads = getTaggedReads(Scop, Schedule);
+  auto Writes = getTaggedMustWrites(Scop, Schedule);
+
+  using namespace matchers;
+  auto ctx = Band.get_ctx();
+  auto _i = placeholder(ctx);
+  auto _ii = placeholder(ctx);
+  auto _j = placeholder(ctx);
+  auto _jj = placeholder(ctx);
+  auto _k = placeholder(ctx);
+  auto _A = arrayPlaceholder();
+  auto _B = arrayPlaceholder();
+  auto _C = arrayPlaceholder();
+  // Placeholders are *not* reused among different calls of allOf, +1 point
+  // to the student who submit a patch for this.
+  auto PsRead =
+      allOf(access(_C, _i, _j), access(_A, _i, _k), access(_B, _k, _j));
+  auto PsWrite = allOf(access(_C, _ii, _jj));
+  auto ReadMatches = match(Reads, PsRead);
+  auto WriteMatches = match(Writes, PsWrite);
+  if ((ReadMatches.size() != 1) || (WriteMatches.size() != 1)) {
+    return false;
+  }
+  if ((ReadMatches[0][_i].payload().inputDimPos_ !=
+       WriteMatches[0][_ii].payload().inputDimPos_) ||
+      (ReadMatches[0][_j].payload().inputDimPos_ !=
+       WriteMatches[0][_jj].payload().inputDimPos_)) {
+    return false;
+  }
+  return true;
+}
+
+/// Walk the schedule tree starting from "Node" and for
+/// each subtree rooted at "Node" fire the matcher. On match
+/// the subtree is wrapped with a mark node with id "MatrMul".
+std::pair<bool, isl::schedule_node>
+ScheduleTreeOptimizer::isMatrMulLike(isl::schedule_node Node,
+                                     const Scop &Scop) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+  // check structural properties.
+  // We expect a three-dimensional loop nest.
+  auto is3DLoop = [&](isl::schedule_node Band) {
+    auto Schedule = isl::union_map::from(Band.band_get_partial_schedule());
+    if (Schedule.n_map() != 1)
+      return false;
+    auto ScheduleAsMap = isl::map::from_union_map(Schedule);
+    if (ScheduleAsMap.dim(isl::dim::in) < 3)
+      return false;
+    return true;
+  };
+
+  // check access patterns properties.
+  auto hasMatrMulAccessPattern = [&](isl::schedule_node Band) {
+    return hasMatrMulAccessPatternImpl(Band, Scop);
+  };
+
+  auto MatcherMatrMul = [&]() {
+    using namespace matchers;
+    // clang-format off
+    return 
+      band(_and(is3DLoop, hasMatrMulAccessPattern),
+        leaf());
+    // clang-format on
+  }();
+
+  auto MatrMulId = isl::id::alloc(Node.get_ctx(), "MatrMul", nullptr);
+  Node = wrapPatternOnMatch(Node, MatcherMatrMul, MatrMulId).root();
+  return std::make_pair(checkIfAnnotated(Node, MatrMulId), Node);
+}
+
+isl::schedule_node
+ScheduleTreeOptimizer::optimizeMatrMulDeclarative(isl::schedule_node Node) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+  return Node;
+}
+
+/// Entry point for MatrMul declarative optimizations.
+isl::schedule_node ScheduleTreeOptimizer::declarativeMatrMulOptimization(
+    isl::schedule_node Node, const OptimizerAdditionalInfoTy *OAI) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+  auto Res = isMatrMulLike(Node, *(OAI->Scop));
+  if (!Res.first)
+    return Node;
+  return optimizeMatrMulDeclarative(Res.second);
+}
+
+/// Entry point for declarative optimizations.
+isl::schedule ScheduleTreeOptimizer::declarativeScheduleOptimizations(
+    isl::schedule Schedule, const OptimizerAdditionalInfoTy *OAI) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+  if (!OAI)
+    llvm_unreachable("expect non null");
+  auto Root = Schedule.get_root();
+  Root = declarativeMatrMulOptimization(Root, OAI);
+  return Root.get_schedule();
+}
+
 __isl_give isl_schedule_node *
 ScheduleTreeOptimizer::optimizeBand(__isl_take isl_schedule_node *Node,
                                     void *User) {
@@ -1619,8 +1857,14 @@ bool IslScheduleOptimizer::runOnScop(Scop &S) {
 
   Function &F = S.getFunction();
   auto *TTI = &getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
-  const OptimizerAdditionalInfoTy OAI = {TTI, const_cast<Dependences *>(&D)};
-  auto NewSchedule = ScheduleTreeOptimizer::optimizeSchedule(Schedule, &OAI);
+  const OptimizerAdditionalInfoTy OAI = {TTI, const_cast<Dependences *>(&D),
+                                         &S};
+  isl::schedule NewSchedule;
+  if (DPMBasedOpts)
+    NewSchedule =
+        ScheduleTreeOptimizer::declarativeScheduleOptimizations(Schedule, &OAI);
+  else
+    NewSchedule = ScheduleTreeOptimizer::optimizeSchedule(Schedule, &OAI);
   walkScheduleTreeForStatistics(NewSchedule, 2);
 
   if (!ScheduleTreeOptimizer::isProfitableSchedule(S, NewSchedule))

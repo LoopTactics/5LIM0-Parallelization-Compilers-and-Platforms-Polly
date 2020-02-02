@@ -52,6 +52,7 @@ class Scop;
 struct OptimizerAdditionalInfoTy {
   const llvm::TargetTransformInfo *TTI;
   const Dependences *D;
+  const Scop *Scop;
 };
 
 /// Parameters of the matrix multiplication operands.
@@ -89,6 +90,13 @@ public:
   static isl::schedule
   optimizeSchedule(isl::schedule Schedule,
                    const polly::OptimizerAdditionalInfoTy *OAI = nullptr);
+  /// Apply schedule tree transformation in a declarative way.
+  ///
+  /// @param Schedule The schedule object to be optimized.
+  /// @param OAI Additional information to the optimizer (TTI, Deps and Scop).
+  static isl::schedule declarativeScheduleOptimizations(
+      isl::schedule Schedule,
+      const polly::OptimizerAdditionalInfoTy *OAI = nullptr);
 
   /// Apply schedule tree transformations.
   ///
@@ -126,6 +134,23 @@ public:
                                                     int VectorWidth);
 
 private:
+  /// Entry point for declarative MatrMul optimization.
+  ///
+  /// @param Root node of the schedule tree.
+  /// @param OAI Additional information for the optimizer.
+  static isl::schedule_node
+  declarativeMatrMulOptimization(isl::schedule_node Root,
+                                 const polly::OptimizerAdditionalInfoTy *OAI);
+  /// Declarative MatrMul optimization.
+  ///
+  /// @param Node Schedule tree node to be inspected.
+  static isl::schedule_node optimizeMatrMulDeclarative(isl::schedule_node Node);
+  /// Declarative MatrMul detection.
+  ///
+  /// @param Node Schedule tree node to be inspected.
+  /// @param Scop
+  static std::pair<bool, isl::schedule_node>
+  isMatrMulLike(isl::schedule_node Node, const polly::Scop &Scop);
   /// Tile a schedule node.
   ///
   /// @param Node            The node to tile.
