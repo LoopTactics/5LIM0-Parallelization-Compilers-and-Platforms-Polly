@@ -67,6 +67,15 @@ struct MatMulInfoTy {
   int i = -1;
   int j = -1;
   int k = -1;
+
+  isl::id Id;
+  int MC = 64;
+  int NC = 1024;
+  int KC = 384;
+
+  int MR = 4;
+  int NR = 4;
+  int KR = 1;
 };
 
 extern bool DisablePollyTiling;
@@ -144,13 +153,16 @@ private:
   /// Declarative MatrMul optimization.
   ///
   /// @param Node Schedule tree node to be inspected.
-  static isl::schedule_node optimizeMatrMulDeclarative(isl::schedule_node Node);
+  static isl::schedule_node
+  optimizeMatrMulDeclarative(isl::schedule_node Node, polly::MatMulInfoTy &MMI);
   /// Declarative MatrMul detection.
   ///
   /// @param Node Schedule tree node to be inspected.
   /// @param Scop
+  /// @param MMI structure.
   static std::pair<bool, isl::schedule_node>
-  isMatrMulLike(isl::schedule_node Node, const polly::Scop &Scop);
+  isMatrMulLike(isl::schedule_node Node, const polly::Scop &Scop,
+                polly::MatMulInfoTy &MMI);
   /// Tile a schedule node.
   ///
   /// @param Node            The node to tile.

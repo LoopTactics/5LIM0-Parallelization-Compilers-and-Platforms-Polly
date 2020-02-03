@@ -1305,6 +1305,7 @@ ScheduleTreeOptimizer::optimizeMatMulPattern(isl::schedule_node Node,
   if (MacroKernelParams.Mc == 1 || MacroKernelParams.Nc == 1 ||
       MacroKernelParams.Kc == 1)
     return Node;
+
   auto MapOldIndVar = getInductionVariablesSubstitution(Node, MicroKernelParams,
                                                         MacroKernelParams);
   if (!MapOldIndVar)
@@ -1461,7 +1462,7 @@ static bool checkIfAnnotated(isl::schedule_node Node, isl::id Id) {
 
 /// Check if "Band" has a MatrMul-like access pattern.
 static bool hasMatrMulAccessPatternImpl(isl::schedule_node Band,
-                                        const Scop &Scop) {
+                                        const Scop &Scop, MatMulInfoTy &MMI) {
   LLVM_DEBUG(dbgs() << __func__ << "\n");
   if (isl_schedule_node_get_type(Band.get()) != isl_schedule_node_band)
     llvm_unreachable("expect a band node");
@@ -1495,6 +1496,13 @@ static bool hasMatrMulAccessPatternImpl(isl::schedule_node Band,
        WriteMatches[0][_jj].payload().inputDimPos_)) {
     return false;
   }
+
+  // fill MMI structure, the indexes position
+  // are rquired for the optimization step.
+  // TODO: fill MMI with the missing info.
+  MMI.i = ReadMatches[0][_i].payload().inputDimPos_;
+  MMI.j = ReadMatches[0][_j].payload().inputDimPos_;
+  MMI.k = ReadMatches[0][_k].payload().inputDimPos_;
   return true;
 }
 
@@ -1502,8 +1510,8 @@ static bool hasMatrMulAccessPatternImpl(isl::schedule_node Band,
 /// each subtree rooted at "Node" fire the matcher. On match
 /// the subtree is wrapped with a mark node with id "MatrMul".
 std::pair<bool, isl::schedule_node>
-ScheduleTreeOptimizer::isMatrMulLike(isl::schedule_node Node,
-                                     const Scop &Scop) {
+ScheduleTreeOptimizer::isMatrMulLike(isl::schedule_node Node, const Scop &Scop,
+                                     MatMulInfoTy &MMI) {
   LLVM_DEBUG(dbgs() << __func__ << "\n");
   // check structural properties.
   // We expect a three-dimensional loop nest.
@@ -1519,7 +1527,7 @@ ScheduleTreeOptimizer::isMatrMulLike(isl::schedule_node Node,
 
   // check access patterns properties.
   auto hasMatrMulAccessPattern = [&](isl::schedule_node Band) {
-    return hasMatrMulAccessPatternImpl(Band, Scop);
+    return hasMatrMulAccessPatternImpl(Band, Scop, MMI);
   };
 
   auto MatcherMatrMul = [&]() {
@@ -1533,12 +1541,263 @@ ScheduleTreeOptimizer::isMatrMulLike(isl::schedule_node Node,
 
   auto MatrMulId = isl::id::alloc(Node.get_ctx(), "MatrMul", nullptr);
   Node = wrapPatternOnMatch(Node, MatcherMatrMul, MatrMulId).root();
-  return std::make_pair(checkIfAnnotated(Node, MatrMulId), Node);
+  auto Res = checkIfAnnotated(Node, MatrMulId);
+  // save the id if we match MatrMul.
+  if (Res)
+    MMI.Id = MatrMulId;
+  return std::make_pair(Res, Node);
+}
+
+/// utility function for replaceDFSPreorderOnce.
+///
+/// NOTE: This is not always possible. Cutting children
+/// in set or sequence is not allowed by ISL and as a consequence
+/// by Loop Tactics.
+isl::schedule_node rebuild(isl::schedule_node Node,
+                           const builders::ScheduleNodeBuilder &Replacement) {
+  Node = Node.cut();
+  Node = Replacement.insertAt(Node);
+  return Node;
+}
+
+/// Helper function for replaceDFSPreorderOnce.
+isl::schedule_node
+replaceOnce(isl::schedule_node Node,
+            const matchers::ScheduleNodeMatcher &Pattern,
+            const builders::ScheduleNodeBuilder &Replacement) {
+  if (matchers::ScheduleNodeMatcher::isMatching(Pattern, Node)) {
+    Node = rebuild(Node, Replacement);
+  }
+  return Node;
+}
+
+/// Walk the schedule tree starting from "node" and in
+/// case of a match with the matcher "pattern" modify
+/// the schedule tree using the builder "replacement".
+isl::schedule_node
+replaceDFSPreorderOnce(isl::schedule_node Node,
+                       const matchers::ScheduleNodeMatcher &Pattern,
+                       const builders::ScheduleNodeBuilder &Replacement) {
+  Node = replaceOnce(Node, Pattern, Replacement);
+  for (int i = 0; i < Node.n_children(); ++i) {
+    Node = replaceDFSPreorderOnce(Node.child(i), Pattern, Replacement).parent();
+  }
+  return Node;
+}
+
+/// Helper function for DoInterchangeOnLoopsImpl.
+/// Swap dimension at position "firstDim" with
+/// the dimension at position "secondDim".
+static isl::multi_union_pw_aff swapDims(isl::multi_union_pw_aff Ps,
+                                        int FirstDim, int SecondDim) {
+  auto ScheduleFirstDim = Ps.get_union_pw_aff(FirstDim);
+  auto ScheduleSecondDim = Ps.get_union_pw_aff(SecondDim);
+  Ps = Ps.set_union_pw_aff(SecondDim, ScheduleFirstDim);
+  Ps = Ps.set_union_pw_aff(FirstDim, ScheduleSecondDim);
+  return Ps;
+}
+
+/// Helper function to interchange loops.
+isl::multi_union_pw_aff DoInterchangeOnLoopsImpl(isl::schedule_node NodeMatrMul,
+                                                 MatMulInfoTy &MMI) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+  if (isl_schedule_node_get_type(NodeMatrMul.get()) != isl_schedule_node_band)
+    llvm_unreachable("expect band node");
+
+  LLVM_DEBUG(dbgs() << MMI.i << MMI.j << MMI.k << "\n");
+  auto Schedule = NodeMatrMul.band_get_partial_schedule();
+  if (MMI.j != 0) {
+    if (MMI.i == 0) {
+      Schedule = swapDims(Schedule, MMI.j, MMI.i);
+      MMI.i = MMI.j;
+      MMI.j = 0;
+    }
+    if (MMI.k == 0) {
+      Schedule = swapDims(Schedule, MMI.j, MMI.k);
+      MMI.k = MMI.j;
+      MMI.j = 0;
+    }
+  }
+  if (MMI.k != 1) {
+    auto oldIPos = MMI.i;
+    Schedule = swapDims(Schedule, MMI.k, MMI.i);
+    MMI.i = MMI.k;
+    MMI.k = oldIPos;
+  }
+  return Schedule;
+}
+
+/// Step 1: Interchange the loops in the loop nest such that i, j and p
+/// are the innermost loops in the following order: j, p and i where i
+/// has the highest level in the loop nest.
+static isl::schedule_node interchangeLoops(isl::schedule_node Node,
+                                           MatMulInfoTy &MMI) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+
+  auto hasMatrMulId = [&](isl::schedule_node Mark) {
+    return (MMI.Id == Mark.mark_get_id());
+  };
+
+  isl::schedule_node NodeMatrMul;
+  auto MatcherMatrMul = [&]() {
+    using namespace matchers;
+    // clang-format off
+    return 
+      mark(hasMatrMulId,
+        band(NodeMatrMul,
+          leaf()));
+    // clang-format on
+  }();
+
+  auto marker = [&]() { return MMI.Id; };
+
+  auto DoInterchangeOnLoops = [&]() {
+    return DoInterchangeOnLoopsImpl(NodeMatrMul, MMI);
+  };
+
+  auto BuilderMatrMul = builders::ScheduleNodeBuilder();
+  {
+    using namespace builders;
+    // clang-format off
+    BuilderMatrMul = 
+      mark(marker, 
+        band(DoInterchangeOnLoops));
+    // clang-format on
+  }
+  return replaceDFSPreorderOnce(Node.root(), MatcherMatrMul, BuilderMatrMul);
+}
+
+std::pair<isl::multi_union_pw_aff, isl::multi_union_pw_aff>
+DoTilingImpl(isl::schedule_node Node, int M, int N, int K) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+  if (isl_schedule_node_get_type(Node.get()) != isl_schedule_node_band)
+    llvm_unreachable("expect band node");
+  auto Space = Node.band_get_space();
+  auto Sizes = isl::multi_val::zero(Space);
+  Sizes = Sizes.set_val(0, isl::val(Node.get_ctx(), M));
+  Sizes = Sizes.set_val(1, isl::val(Node.get_ctx(), N));
+  Sizes = Sizes.set_val(2, isl::val(Node.get_ctx(), K));
+  Node =
+      isl::manage(isl_schedule_node_band_tile(Node.release(), Sizes.release()));
+  return std::make_pair(Node.band_get_partial_schedule(),
+                        Node.child(0).band_get_partial_schedule());
+}
+
+/// Step 2: Tile i, j and k with MC, NC and KC respecitvely, to produce
+/// i_c, j_c and p_c and interchange i_c and p_c.
+static isl::schedule_node tileLoopsForMacroKernel(isl::schedule_node Node,
+                                                  MatMulInfoTy &MMI) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+
+  auto hasMatrMulId = [&](isl::schedule_node Mark) {
+    return (MMI.Id == Mark.mark_get_id());
+  };
+
+  isl::schedule_node NodeMatrMul;
+  auto MatcherMatrMul = [&]() {
+    using namespace matchers;
+    // clang-format off
+    return 
+      mark(hasMatrMulId,
+        band(NodeMatrMul,
+          leaf()));
+    // clang-format on
+  }();
+
+  auto marker = [&]() { return MMI.Id; };
+
+  auto DoTilingAndGetTileLoops = [&]() {
+    return DoTilingImpl(NodeMatrMul, MMI.NC, MMI.KC, MMI.MC).first;
+  };
+
+  auto DoTilingAndGetPointLoops = [&]() {
+    auto NewSchedule = DoTilingImpl(NodeMatrMul, MMI.NC, MMI.KC, MMI.MC).second;
+    // interchange.
+    NewSchedule = swapDims(NewSchedule, 2, 1);
+    return NewSchedule;
+  };
+
+  auto BuilderMatrMul = builders::ScheduleNodeBuilder();
+  {
+    using namespace builders;
+    // clang-format off
+    BuilderMatrMul =
+       mark(marker, 
+        band(DoTilingAndGetTileLoops, 
+          band(DoTilingAndGetPointLoops)));
+    // clang-format on
+  }
+  return replaceDFSPreorderOnce(Node.root(), MatcherMatrMul, BuilderMatrMul);
+}
+
+/// Step 3: Tile i_c, j_c and p_c with Mr, Nr and 1 respectively to produce
+/// i_r, j_r and p_r and fully unroll p_r.
+static isl::schedule_node tileLoopsForMicroKernel(isl::schedule_node Node,
+                                                  MatMulInfoTy &MMI) {
+  LLVM_DEBUG(dbgs() << __func__ << "\n");
+
+  auto hasMatrMulId = [&](isl::schedule_node Mark) {
+    return (MMI.Id == Mark.mark_get_id());
+  };
+
+  isl::schedule_node NodeMatrMulTileLoops, NodeMatrMulPointLoops;
+  auto MatcherMatrMul = [&]() {
+    using namespace matchers;
+    // clang-format off
+    return 
+      mark(hasMatrMulId,
+        band(NodeMatrMulTileLoops,
+          band(NodeMatrMulPointLoops,
+            leaf())));
+    // clang-format on
+  }();
+
+  auto marker = [&]() { return MMI.Id; };
+
+  auto getScheduleTile = [&]() {
+    return NodeMatrMulTileLoops.band_get_partial_schedule();
+  };
+
+  auto DoTilingAndGetTileLoops = [&]() {
+    return DoTilingImpl(NodeMatrMulPointLoops, MMI.NR, MMI.MR, MMI.KR).first;
+  };
+
+  auto DoTilingAndGetPointLoops = [&]() {
+    using namespace builders;
+    auto Descr = BandDescriptor(NodeMatrMulPointLoops);
+    auto NewSchedule =
+        DoTilingImpl(NodeMatrMulPointLoops, MMI.NR, MMI.MR, MMI.KR).second;
+    Descr.partialSchedule = NewSchedule;
+    Descr.astOptions =
+        isl::union_set(NodeMatrMulPointLoops.get_ctx(), "{unroll[x]}");
+    return Descr;
+  };
+
+  auto BuilderMatrMul = builders::ScheduleNodeBuilder();
+  {
+    using namespace builders;
+    // clang-format off
+    BuilderMatrMul =
+      mark(marker,
+        band(getScheduleTile,  
+          band(DoTilingAndGetTileLoops,
+            band(DoTilingAndGetPointLoops))));
+    // clang-format on
+  }
+  return replaceDFSPreorderOnce(Node.root(), MatcherMatrMul, BuilderMatrMul);
 }
 
 isl::schedule_node
-ScheduleTreeOptimizer::optimizeMatrMulDeclarative(isl::schedule_node Node) {
+ScheduleTreeOptimizer::optimizeMatrMulDeclarative(isl::schedule_node Node,
+                                                  MatMulInfoTy &MMI) {
   LLVM_DEBUG(dbgs() << __func__ << "\n");
+  if ((MMI.i == -1) || (MMI.j == -1) || (MMI.k == -1))
+    llvm_unreachable("MMI i-j-k not filled");
+  if (!MMI.Id)
+    llvm_unreachable("MMI id not filled");
+  Node = interchangeLoops(Node, MMI).root();
+  Node = tileLoopsForMacroKernel(Node, MMI).root();
+  Node = tileLoopsForMicroKernel(Node, MMI).root();
   return Node;
 }
 
@@ -1546,10 +1805,11 @@ ScheduleTreeOptimizer::optimizeMatrMulDeclarative(isl::schedule_node Node) {
 isl::schedule_node ScheduleTreeOptimizer::declarativeMatrMulOptimization(
     isl::schedule_node Node, const OptimizerAdditionalInfoTy *OAI) {
   LLVM_DEBUG(dbgs() << __func__ << "\n");
-  auto Res = isMatrMulLike(Node, *(OAI->Scop));
+  MatMulInfoTy MMI;
+  auto Res = isMatrMulLike(Node, *(OAI->Scop), MMI);
   if (!Res.first)
     return Node;
-  return optimizeMatrMulDeclarative(Res.second);
+  return optimizeMatrMulDeclarative(Res.second, MMI);
 }
 
 /// Entry point for declarative optimizations.
