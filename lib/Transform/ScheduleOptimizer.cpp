@@ -270,9 +270,24 @@ static cl::opt<bool>
                 cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
 
 static cl::opt<bool>
-    DPMBasedOpts("polly-declarative-pattern-matching-based-opts",
+    DPMBasedOptsOne("polly-declarative-pattern-matching-based-opts-step-one",
                  cl::desc("Perform optimizations with Loop Tactics"),
                  cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
+
+static cl::opt<bool>
+    DPMBasedOptsTwo("polly-declarative-pattern-matching-based-opts-step-two",
+                 cl::desc("Perform optimizations with Loop Tactics"),
+                 cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
+
+static cl::opt<bool>
+    DPMBasedOptsThree("polly-declarative-pattern-matching-based-opts-step-three",
+                 cl::desc("Perform optimizations with Loop Tactics"),
+                 cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
+
+static cl::opt<bool>
+    DPMBasedOptsOnlyDetection("polly-declarative-pattern-matching-based-opts-only-detection",
+                              cl::desc("Perform detection with Loop Tactics"),
+                              cl::init(false), cl::ZeroOrMore, cl::cat(PollyCategory));
 
 static cl::opt<bool> OptimizedScops(
     "polly-optimized-scops",
@@ -1796,7 +1811,11 @@ ScheduleTreeOptimizer::optimizeMatrMulDeclarative(isl::schedule_node Node,
   if (!MMI.Id)
     llvm_unreachable("MMI id not filled");
   Node = interchangeLoops(Node, MMI).root();
+  if (DPMBasedOptsOne)
+    return Node;
   Node = tileLoopsForMacroKernel(Node, MMI).root();
+  if (DPMBasedOptsTwo)
+    return Node;
   Node = tileLoopsForMicroKernel(Node, MMI).root();
   return Node;
 }
@@ -1809,6 +1828,9 @@ isl::schedule_node ScheduleTreeOptimizer::declarativeMatrMulOptimization(
   auto Res = isMatrMulLike(Node, *(OAI->Scop), MMI);
   if (!Res.first)
     return Node;
+  // do only detetction.
+  if (DPMBasedOptsOnlyDetection)
+    return Res.second;
   return optimizeMatrMulDeclarative(Res.second, MMI);
 }
 
@@ -2120,7 +2142,7 @@ bool IslScheduleOptimizer::runOnScop(Scop &S) {
   const OptimizerAdditionalInfoTy OAI = {TTI, const_cast<Dependences *>(&D),
                                          &S};
   isl::schedule NewSchedule;
-  if (DPMBasedOpts)
+  if (DPMBasedOptsOne || DPMBasedOptsTwo || DPMBasedOptsThree || DPMBasedOptsOnlyDetection)
     NewSchedule =
         ScheduleTreeOptimizer::declarativeScheduleOptimizations(Schedule, &OAI);
   else
